@@ -37,6 +37,8 @@ import software.amazon.awssdk.services.kinesis.KinesisClient;
 import software.amazon.awssdk.services.kinesis.model.PutRecordsRequest;
 import software.amazon.awssdk.services.kinesis.model.PutRecordsRequestEntry;
 import software.amazon.awssdk.services.kinesis.model.PutRecordsResponse;
+import software.amazon.awssdk.services.kinesis.model.PutRecordsResultEntry;
+import java.util.ArrayList;
 
 import static io.kestra.core.utils.Rethrow.throwConsumer;
 import static io.kestra.core.utils.Rethrow.throwFunction;
@@ -122,6 +124,7 @@ import static io.kestra.core.utils.Rethrow.throwFunction;
 public class PutRecords extends AbstractKinesis implements RunnableTask<PutRecords.Output> {
     private static final ObjectMapper MAPPER = JacksonMapper.ofIon()
         .setSerializationInclusion(JsonInclude.Include.ALWAYS);
+    private static final int MAX_BATCH_SIZE = 500;
 
     @NotNull
     @Schema(
@@ -184,27 +187,47 @@ public class PutRecords extends AbstractKinesis implements RunnableTask<PutRecor
             .build();
     }
 
-    private PutRecordsResponse putRecords(RunContext runContext, List<Record> records) throws IllegalVariableEvaluationException {
+    private PutRecordsResponse putRecords(RunContext runContext, List<Record> records) throws Exception {
         try (KinesisClient client = client(runContext)) {
-            PutRecordsRequest.Builder builder = PutRecordsRequest.builder();
-
             var renderedStreamArn = runContext.render(streamArn).as(String.class).orElse(null);
             var renderedStreamName = runContext.render(streamName).as(String.class).orElse(null);
-            if (!Strings.isNullOrEmpty(renderedStreamArn)) {
-                builder.streamARN(renderedStreamArn);
-            } else if (!Strings.isNullOrEmpty(renderedStreamName)) {
-                builder.streamName(renderedStreamName);
-            } else {
+            if (Strings.isNullOrEmpty(renderedStreamArn) && Strings.isNullOrEmpty(renderedStreamName)) {
                 throw new IllegalArgumentException("Either streamName or streamArn has to be set.");
             }
 
             List<PutRecordsRequestEntry> putRecordsRequestEntryList = records.stream()
                 .map(throwFunction(record -> record.toPutRecordsRequestEntry(runContext)))
-                .collect(Collectors.toList());
+                .toList();
 
-            builder.records(putRecordsRequestEntryList);
-            return client.putRecords(builder.build());
+            var allResponseEntries = new ArrayList<PutRecordsResultEntry>();
+            var totalFailedCount = 0;
+
+            for (var i = 0; i < putRecordsRequestEntryList.size(); i += MAX_BATCH_SIZE) {
+                var batch = putRecordsRequestEntryList.subList(i, Math.min(i + MAX_BATCH_SIZE, putRecordsRequestEntryList.size()));
+                PutRecordsRequest.Builder builder = PutRecordsRequest.builder();
+                if (!Strings.isNullOrEmpty(renderedStreamArn)) {
+                    builder.streamARN(renderedStreamArn);
+                } else {
+                    builder.streamName(renderedStreamName);
+                }
+                builder.records(batch);
+
+                var response = client.putRecords(builder.build());
+                if (response.records() != null) {
+                    allResponseEntries.addAll(response.records());
+                }
+                totalFailedCount += response.failedRecordCount() != null ? response.failedRecordCount() : 0;
+            }
+
+            return PutRecordsResponse.builder()
+                .records(allResponseEntries)
+                .failedRecordCount(totalFailedCount)
+                .build();
         }
+    }
+
+    protected KinesisClient client(RunContext runContext) throws IllegalVariableEvaluationException {
+        return super.client(runContext);
     }
 
     private List<Record> getRecordList(Object records, RunContext runContext) throws IllegalVariableEvaluationException, URISyntaxException, IOException {
